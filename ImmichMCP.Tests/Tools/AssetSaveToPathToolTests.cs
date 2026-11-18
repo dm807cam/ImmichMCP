@@ -110,9 +110,9 @@ public class AssetSaveToPathToolTests : IDisposable
         var root = Root(await AssetTools.SaveToPath(client, Id1, Dir()));
 
         // Assert: the unrelated file is untouched, the asset lands next to it
-        File(root, 0).GetProperty("file").GetString().Should().Be("IMG_1_11111111.HEIC");
+        File(root, 0).GetProperty("file").GetString().Should().Be($"IMG_1_{Id1}.HEIC");
         (await System.IO.File.ReadAllBytesAsync(foreign)).Should().Equal(new byte[] { 42 });
-        (await System.IO.File.ReadAllBytesAsync(Path.Combine(Dir(), "IMG_1_11111111.HEIC"))).Should().Equal(bytes);
+        (await System.IO.File.ReadAllBytesAsync(Path.Combine(Dir(), $"IMG_1_{Id1}.HEIC"))).Should().Equal(bytes);
     }
 
     [Fact]
@@ -133,9 +133,9 @@ public class AssetSaveToPathToolTests : IDisposable
         // Assert
         root.GetProperty("result").GetProperty("saved").GetInt32().Should().Be(2);
         File(root, 0).GetProperty("file").GetString().Should().Be("IMG_4229.HEIC");
-        File(root, 1).GetProperty("file").GetString().Should().Be("IMG_4229_22222222.HEIC");
+        File(root, 1).GetProperty("file").GetString().Should().Be($"IMG_4229_{Id2}.HEIC");
         (await System.IO.File.ReadAllBytesAsync(Path.Combine(Dir(), "IMG_4229.HEIC"))).Should().Equal(first);
-        (await System.IO.File.ReadAllBytesAsync(Path.Combine(Dir(), "IMG_4229_22222222.HEIC"))).Should().Equal(second);
+        (await System.IO.File.ReadAllBytesAsync(Path.Combine(Dir(), $"IMG_4229_{Id2}.HEIC"))).Should().Equal(second);
     }
 
     [Fact]
@@ -155,15 +155,15 @@ public class AssetSaveToPathToolTests : IDisposable
 
         // Assert
         var file = File(first, 0);
-        file.GetProperty("file").GetString().Should().Be("IMG_4229_11111111_preview.jpg");
+        file.GetProperty("file").GetString().Should().Be($"IMG_4229_{Id1}_preview.jpg");
         file.TryGetProperty("checksum_verified", out _).Should().BeFalse("rendered images have no Immich checksum");
-        (await System.IO.File.ReadAllBytesAsync(Path.Combine(Dir(), "IMG_4229_11111111_preview.jpg"))).Should().Equal(jpeg);
+        (await System.IO.File.ReadAllBytesAsync(Path.Combine(Dir(), $"IMG_4229_{Id1}_preview.jpg"))).Should().Equal(jpeg);
         File(second, 0).GetProperty("status").GetString().Should().Be("exists");
         handler.GetMatchCount(preview).Should().Be(1);
     }
 
     [Fact]
-    public async Task SaveToPath_ReportsChecksumMismatch()
+    public async Task SaveToPath_RejectsChecksumMismatch_WithoutWritingTheFile()
     {
         // Arrange
         var (client, handler) = MockHttpClientFactory.CreateMockClient();
@@ -174,8 +174,78 @@ public class AssetSaveToPathToolTests : IDisposable
         var root = Root(await AssetTools.SaveToPath(client, Id1, Dir()));
 
         // Assert
+        root.GetProperty("ok").GetBoolean().Should().BeFalse();
+        var file = root.GetProperty("error").GetProperty("details").GetProperty("files")[0];
+        file.GetProperty("status").GetString().Should().Be("checksum_mismatch");
+        Directory.GetFiles(Dir()).Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task SaveToPath_KeepsTheExistingOriginal_WhenTheReplacementFailsTheChecksum()
+    {
+        // Arrange: a good copy is already there, the server sends corrupt bytes
+        var (client, handler) = MockHttpClientFactory.CreateMockClient();
+        var good = new byte[] { 7, 7, 7 };
+        MockAsset(handler, Id1, "IMG_1.HEIC", Sha1(good));
+        MockOriginal(handler, Id1, new byte[] { 6, 6 });
+        Directory.CreateDirectory(Dir());
+        var path = Path.Combine(Dir(), "IMG_1.HEIC");
+        await System.IO.File.WriteAllBytesAsync(path, good);
+
+        // Act
+        var root = Root(await AssetTools.SaveToPath(client, Id1, Dir(), overwrite: true));
+
+        // Assert
+        root.GetProperty("ok").GetBoolean().Should().BeFalse();
+        root.GetProperty("error").GetProperty("details").GetProperty("files")[0].GetProperty("status").GetString()
+            .Should().Be("checksum_mismatch");
+        (await System.IO.File.ReadAllBytesAsync(path)).Should().Equal(good);
+        Directory.GetFiles(Dir()).Should().ContainSingle();
+    }
+
+    [Fact]
+    public async Task SaveToPath_LeavesAnUnrelatedPartFileAlone()
+    {
+        // Arrange
+        var (client, handler) = MockHttpClientFactory.CreateMockClient();
+        var bytes = new byte[] { 3, 3 };
+        MockAsset(handler, Id1, "IMG_1.HEIC", Sha1(bytes));
+        MockOriginal(handler, Id1, bytes);
+        Directory.CreateDirectory(Dir());
+        var part = Path.Combine(Dir(), "IMG_1.HEIC.part");
+        await System.IO.File.WriteAllBytesAsync(part, new byte[] { 42, 42, 42 });
+
+        // Act
+        var root = Root(await AssetTools.SaveToPath(client, Id1, Dir()));
+
+        // Assert
         File(root, 0).GetProperty("status").GetString().Should().Be("saved");
-        File(root, 0).GetProperty("checksum_verified").GetBoolean().Should().BeFalse();
+        (await System.IO.File.ReadAllBytesAsync(part)).Should().Equal(new byte[] { 42, 42, 42 });
+        (await System.IO.File.ReadAllBytesAsync(Path.Combine(Dir(), "IMG_1.HEIC"))).Should().Equal(bytes);
+        Directory.GetFiles(Dir()).Should().HaveCount(2);
+    }
+
+    [Fact]
+    public async Task SaveToPath_GivesPreviewsOfIdsWithTheSamePrefix_TheirOwnFiles()
+    {
+        // Arrange: same original name, IDs that only differ after the first eight characters
+        const string a = "11111111-aaaa-4bbb-8ccc-000000000001";
+        const string b = "11111111-bbbb-4ccc-8ddd-000000000002";
+        var (client, handler) = MockHttpClientFactory.CreateMockClient();
+        MockAsset(handler, a, "IMG_4229.HEIC");
+        MockAsset(handler, b, "IMG_4229.HEIC");
+        handler.When(HttpMethod.Get, $"*/assets/{a}/thumbnail").Respond(Serve(new byte[] { 0xA }, "image/jpeg"));
+        handler.When(HttpMethod.Get, $"*/assets/{b}/thumbnail").Respond(Serve(new byte[] { 0xB }, "image/jpeg"));
+
+        // Act
+        var first = Root(await AssetTools.SaveToPath(client, a, Dir(), size: "preview"));
+        var second = Root(await AssetTools.SaveToPath(client, b, Dir(), size: "preview"));
+
+        // Assert
+        File(first, 0).GetProperty("status").GetString().Should().Be("saved");
+        File(second, 0).GetProperty("status").GetString().Should().Be("saved");
+        (await System.IO.File.ReadAllBytesAsync(Path.Combine(Dir(), $"IMG_4229_{a}_preview.jpg"))).Should().Equal(new byte[] { 0xA });
+        (await System.IO.File.ReadAllBytesAsync(Path.Combine(Dir(), $"IMG_4229_{b}_preview.jpg"))).Should().Equal(new byte[] { 0xB });
     }
 
     [Theory]
@@ -186,7 +256,7 @@ public class AssetSaveToPathToolTests : IDisposable
     {
         // Arrange
         var (client, handler) = MockHttpClientFactory.CreateMockClient();
-        MockAsset(handler, Id1, originalFileName);
+        MockAsset(handler, Id1, originalFileName, Sha1(new byte[] { 1 }));
         MockOriginal(handler, Id1, new byte[] { 1 }, "application/octet-stream");
 
         // Act
@@ -273,7 +343,7 @@ public class AssetSaveToPathToolTests : IDisposable
         // Arrange
         var saveRoot = Path.Combine(_root, "allowed");
         var (client, handler) = MockHttpClientFactory.CreateMockClient(saveRootDirectory: saveRoot);
-        MockAsset(handler, Id1, "IMG_1.HEIC");
+        MockAsset(handler, Id1, "IMG_1.HEIC", Sha1(new byte[] { 1 }));
         MockOriginal(handler, Id1, new byte[] { 1 });
 
         // Act
@@ -287,5 +357,50 @@ public class AssetSaveToPathToolTests : IDisposable
         inside.GetProperty("ok").GetBoolean().Should().BeTrue();
         System.IO.File.Exists(Path.Combine(saveRoot, "trip", "IMG_1.HEIC")).Should().BeTrue();
         Directory.Exists(Path.Combine(_root, "elsewhere")).Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task SaveToPath_RejectsALinkInsideSaveRootThatLeadsOutside()
+    {
+        // Arrange: /allowed/link -> /outside
+        var saveRoot = Path.Combine(_root, "allowed");
+        var outside = Path.Combine(_root, "outside");
+        Directory.CreateDirectory(saveRoot);
+        Directory.CreateDirectory(outside);
+        Directory.CreateSymbolicLink(Path.Combine(saveRoot, "link"), outside);
+        var (client, handler) = MockHttpClientFactory.CreateMockClient(saveRootDirectory: saveRoot);
+        MockAsset(handler, Id1, "IMG_1.HEIC");
+        MockOriginal(handler, Id1, new byte[] { 1 });
+
+        // Act
+        var direct = Root(await AssetTools.SaveToPath(client, Id1, Path.Combine(saveRoot, "link")));
+        var below = Root(await AssetTools.SaveToPath(client, Id1, Path.Combine(saveRoot, "link", "sub")));
+
+        // Assert
+        direct.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
+        below.GetProperty("error").GetProperty("code").GetString().Should().Be("VALIDATION");
+        Directory.EnumerateFileSystemEntries(outside).Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task SaveToPath_AllowsLinksThatStayInsideSaveRoot_AndASaveRootReachedThroughALink()
+    {
+        // Arrange: the root is configured via a link, and holds a link to a folder of its own
+        var realRoot = Path.Combine(_root, "real");
+        Directory.CreateDirectory(Path.Combine(realRoot, "photos"));
+        Directory.CreateSymbolicLink(Path.Combine(realRoot, "shortcut"), Path.Combine(realRoot, "photos"));
+        var linkedRoot = Path.Combine(_root, "linked");
+        Directory.CreateSymbolicLink(linkedRoot, realRoot);
+        var bytes = new byte[] { 5 };
+        var (client, handler) = MockHttpClientFactory.CreateMockClient(saveRootDirectory: linkedRoot);
+        MockAsset(handler, Id1, "IMG_1.HEIC", Sha1(bytes));
+        MockOriginal(handler, Id1, bytes);
+
+        // Act
+        var root = Root(await AssetTools.SaveToPath(client, Id1, Path.Combine(realRoot, "shortcut")));
+
+        // Assert
+        root.GetProperty("ok").GetBoolean().Should().BeTrue();
+        System.IO.File.Exists(Path.Combine(realRoot, "photos", "IMG_1.HEIC")).Should().BeTrue();
     }
 }

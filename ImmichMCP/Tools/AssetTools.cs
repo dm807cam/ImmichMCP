@@ -332,8 +332,8 @@ public static class AssetTools
     [Description(
         "Save assets from Immich into a local directory on the machine running this MCP server and return the " +
         "file names, so they can be opened or processed directly. size='original' (default) writes the uploaded " +
-        "file under its original name and verifies it against the Immich checksum; 'fullsize', 'preview' and " +
-        "'thumbnail' write server-rendered images named <name>_<id8>_<size>.<ext>. Files already present with the " +
+        "file under its original name and verifies it against the Immich checksum before it is written; " +
+        "'fullsize', 'preview' and 'thumbnail' write server-rendered images named <name>_<asset id>_<size>.<ext>. Files already present with the " +
         "same content are skipped, so re-running is safe. Available in stdio mode; over HTTP only when " +
         "SAVE_ROOT_DIR is set. If SAVE_ROOT_DIR is set, the directory must be inside it.")]
     public static async Task<string> SaveToPath(
@@ -374,6 +374,14 @@ public static class AssetTools
         try
         {
             Directory.CreateDirectory(targetDir);
+
+            // Check again now that the directory exists, in case a link was put in place meanwhile.
+            if (ResolveSaveDirectory(targetDir, client.SaveRootDirectory, out var createdDir) is { } createdError)
+            {
+                return ValidationError(client, createdError);
+            }
+
+            targetDir = createdDir;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -411,7 +419,17 @@ public static class AssetTools
                 continue;
             }
 
-            var plan = PlanSave(asset, i, size, targetDir, overwrite, claimed);
+            SavePlan plan;
+            try
+            {
+                plan = PlanSave(asset, i, size, targetDir, overwrite, claimed);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                files[i] = SavedFile.Failed(asset.Id, "failed", ex.Message);
+                continue;
+            }
+
             if (plan.Done is { } done)
             {
                 files[i] = done;
@@ -424,6 +442,9 @@ public static class AssetTools
 
         await Parallel.ForEachAsync(plans, parallel, async (plan, ct) =>
         {
+            // Originals are checked against the Immich checksum while still in their temporary
+            // file, so a bad download never replaces anything.
+            var expected = size == "original" && !string.IsNullOrEmpty(plan.Asset.Checksum) ? plan.Asset.Checksum : null;
             try
             {
                 var download = await client.DownloadAssetToFileAsync(
@@ -431,12 +452,14 @@ public static class AssetTools
                     size,
                     mimeType => plan.TargetPath ?? Path.Combine(targetDir, plan.NamePrefix + ExtensionFor(mimeType)),
                     overwrite,
+                    expected,
                     ct).ConfigureAwait(false);
 
-                bool? verified = size == "original" && !string.IsNullOrEmpty(plan.Asset.Checksum)
-                    ? download.Sha1Base64 == plan.Asset.Checksum
-                    : null;
-                files[plan.Index] = SavedFile.Saved(plan.Asset.Id, Path.GetFileName(download.Path), download.Bytes, verified);
+                files[plan.Index] = SavedFile.Saved(plan.Asset.Id, Path.GetFileName(download.Path), download.Bytes, expected != null ? true : null);
+            }
+            catch (InvalidDataException ex)
+            {
+                files[plan.Index] = SavedFile.Failed(plan.Asset.Id, "checksum_mismatch", ex.Message, plan.TargetPath is { } p ? Path.GetFileName(p) : null);
             }
             catch (Exception ex) when (ex is ImmichApiException or HttpRequestException or IOException or UnauthorizedAccessException)
             {
@@ -489,15 +512,16 @@ public static class AssetTools
 
     private static SavePlan PlanSave(Asset asset, int index, string size, string directory, bool overwrite, HashSet<string> claimed)
     {
-        var id8 = asset.Id.Length > 8 ? asset.Id[..8] : asset.Id;
-        var fileName = SafeFileName(asset.OriginalFileName, asset.Id);
+        // The full asset ID, not a prefix of it: IDs may share their first characters.
+        var id = SafeFileName(asset.Id, "asset");
+        var fileName = SafeFileName(asset.OriginalFileName, id);
         var stem = Path.GetFileNameWithoutExtension(fileName);
 
         if (size != "original")
         {
             // Rendered images carry the asset ID in their name, so they cannot collide. The
             // extension follows the served media type, so look for any earlier copy.
-            var prefix = $"{stem}_{id8}_{size}";
+            var prefix = $"{stem}_{id}_{size}";
             var earlier = overwrite
                 ? null
                 : Directory.EnumerateFiles(directory).FirstOrDefault(f =>
@@ -508,7 +532,7 @@ public static class AssetTools
                 : new SavePlan(index, asset, null, prefix, SavedFile.Existing(asset.Id, Path.GetFileName(earlier), new FileInfo(earlier).Length));
         }
 
-        foreach (var candidate in new[] { fileName, $"{stem}_{id8}{Path.GetExtension(fileName)}" })
+        foreach (var candidate in new[] { fileName, $"{stem}_{id}{Path.GetExtension(fileName)}" })
         {
             var path = Path.Combine(directory, candidate);
             if (!claimed.Add(path))
@@ -585,10 +609,78 @@ public static class AssetTools
             return null;
         }
 
+        // Compare where the paths really lead: a symbolic link (or junction) below the root
+        // could otherwise point anywhere. The resolved path is also the one written to.
         var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(ExpandHome(saveRoot.Trim())));
-        var inside = fullPath.Equals(root, StringComparison.Ordinal) ||
-                     fullPath.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal);
-        return inside ? null : $"directory must be inside SAVE_ROOT_DIR ({root})";
+        string realRoot, realPath;
+        try
+        {
+            realRoot = ResolveLinks(root);
+            realPath = ResolveLinks(fullPath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return $"Cannot resolve {fullPath}: {ex.Message}";
+        }
+
+        var rootPrefix = Path.EndsInDirectorySeparator(realRoot) ? realRoot : realRoot + Path.DirectorySeparatorChar;
+        var inside = realPath.Equals(realRoot, StringComparison.Ordinal) ||
+                     realPath.StartsWith(rootPrefix, StringComparison.Ordinal);
+        if (!inside)
+        {
+            return $"directory must be inside SAVE_ROOT_DIR ({root})";
+        }
+
+        fullPath = realPath;
+        return null;
+    }
+
+    /// <summary>
+    /// Follows every symbolic link or junction along an absolute path, like realpath(3), but
+    /// also for paths whose tail does not exist yet (those parts are kept as they are).
+    /// </summary>
+    private static string ResolveLinks(string path)
+    {
+        const int maxLinks = 40;
+        var current = Path.GetFullPath(path);
+        for (var links = 0; ; links++)
+        {
+            if (links > maxLinks)
+            {
+                throw new IOException($"Too many levels of symbolic links in {path}");
+            }
+
+            var root = Path.GetPathRoot(current)!;
+            var segments = current[root.Length..].Split(
+                [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries);
+            var resolved = root;
+            string? spliced = null;
+            for (var i = 0; i < segments.Length && spliced == null; i++)
+            {
+                var next = Path.Combine(resolved, segments[i]);
+                FileSystemInfo info = Directory.Exists(next) ? new DirectoryInfo(next) : new FileInfo(next);
+                if (info.LinkTarget is { } target)
+                {
+                    // Splice the link target in and start over, since the target may hold links itself.
+                    spliced = Path.GetFullPath(Path.Combine([Path.GetFullPath(target, resolved), .. segments[(i + 1)..]]));
+                }
+                else if (!info.Exists)
+                {
+                    return Path.TrimEndingDirectorySeparator(Path.Combine([next, .. segments[(i + 1)..]]));
+                }
+                else
+                {
+                    resolved = next;
+                }
+            }
+
+            if (spliced == null)
+            {
+                return Path.TrimEndingDirectorySeparator(resolved);
+            }
+
+            current = spliced;
+        }
     }
 
     private static string ExpandHome(string path)

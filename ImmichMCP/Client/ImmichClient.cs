@@ -355,13 +355,16 @@ public class ImmichClient
     /// "fullsize", "preview" and "thumbnail" are images rendered by the server.
     /// <paramref name="resolveTargetPath"/> receives the served media type and returns the
     /// target path, so a file extension can follow what the server actually sent. The body
-    /// goes to a temporary ".part" file that is moved into place only once it is complete.
+    /// goes to a temporary file of its own that is moved into place only once it is complete
+    /// and, when <paramref name="expectedSha1Base64"/> is given, matches that checksum; on a
+    /// mismatch an <see cref="InvalidDataException"/> is thrown and the target is left as it was.
     /// </summary>
     public async Task<AssetFileDownload> DownloadAssetToFileAsync(
         string id,
         string size,
         Func<string, string> resolveTargetPath,
         bool overwrite,
+        string? expectedSha1Base64 = null,
         CancellationToken cancellationToken = default)
     {
         var url = size == "original"
@@ -377,15 +380,21 @@ public class ImmichClient
 
         var mimeType = response.Content.Headers.ContentType?.MediaType ?? "application/octet-stream";
         var targetPath = resolveTargetPath(mimeType);
-        var partPath = targetPath + ".part";
+
+        // A fresh name per call, opened with CreateNew: never truncates a file that is already
+        // there and never shares a temporary file with a concurrent save.
+        var partPath = $"{targetPath}.{Guid.NewGuid():N}.part";
+        var created = false;
 
         using var sha1 = IncrementalHash.CreateHash(HashAlgorithmName.SHA1);
         long bytes = 0;
+        string hash;
         try
         {
             await using (var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false))
-            await using (var target = new FileStream(partPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true))
+            await using (var target = new FileStream(partPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, useAsync: true))
             {
+                created = true;
                 var chunk = new byte[81920];
                 int read;
                 while ((read = await source.ReadAsync(chunk, cancellationToken).ConfigureAwait(false)) > 0)
@@ -396,15 +405,26 @@ public class ImmichClient
                 }
             }
 
+            hash = Convert.ToBase64String(sha1.GetHashAndReset());
+            if (expectedSha1Base64 != null && hash != expectedSha1Base64)
+            {
+                throw new InvalidDataException(
+                    $"Checksum mismatch: Immich reports {expectedSha1Base64}, the download has {hash}. Nothing was written.");
+            }
+
             File.Move(partPath, targetPath, overwrite);
         }
         catch
         {
-            try { File.Delete(partPath); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            if (created)
+            {
+                try { File.Delete(partPath); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            }
+
             throw;
         }
 
-        return new AssetFileDownload(targetPath, bytes, mimeType, Convert.ToBase64String(sha1.GetHashAndReset()));
+        return new AssetFileDownload(targetPath, bytes, mimeType, hash);
     }
 
     #endregion
